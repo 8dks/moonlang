@@ -765,7 +765,7 @@ Value* LLVMCodeGen::generateBuiltinCall(const std::string& name, const std::vect
     }
     
     // GUI functions - set flag for WINDOWS subsystem
-    if (name.substr(0, 4) == "gui_") {
+    if (funcName.substr(0, 4) == "gui_") {
         usesGUI = true;
     }
     
@@ -781,7 +781,7 @@ Value* LLVMCodeGen::generateBuiltinCall(const std::string& name, const std::vect
     }
     
     // GUI functions (0 args)
-    if (funcName == "gui_init" || name == "gui_run") {
+    if (funcName == "gui_init" || funcName == "gui_run") {
         if (funcName == "gui_init") {
             return builder->CreateCall(getRuntimeFunction("moon_gui_init"), {});
         } else {
@@ -791,14 +791,15 @@ Value* LLVMCodeGen::generateBuiltinCall(const std::string& name, const std::vect
     }
     
     // GUI functions (1 arg) - but NOT gui_create with 4 args
-    if ((name == "gui_create" && args.size() == 1) || name == "gui_alert" || name == "gui_confirm") {
+    if ((funcName == "gui_create" && args.size() == 1) || funcName == "gui_alert" || funcName == "gui_confirm") {
         Value* arg = generateExpression(args[0]);
-        Value* result = builder->CreateCall(getRuntimeFunction("moon_" + name), {arg});
+        Value* result = builder->CreateCall(getRuntimeFunction("moon_" + funcName), {arg});
         builder->CreateCall(getRuntimeFunction("moon_release"), {arg});
         return result;
     }
     
-    // gui_create(title, width, height, options) - 4 args (MUST be before 2-arg gui_show check)
+    // gui_create(title, width, height, options) - 4 args.
+    // Keep this explicit branch before other GUI overloads to avoid mismatched dispatch.
     if (funcName == "gui_create" && args.size() == 4) {
         Value* arg1 = generateExpression(args[0]);
         Value* arg2 = generateExpression(args[1]);

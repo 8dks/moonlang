@@ -32,6 +32,15 @@ using namespace Microsoft::WRL;
 #ifndef DWMWA_WINDOW_CORNER_PREFERENCE
 #define DWMWA_WINDOW_CORNER_PREFERENCE 33
 #endif
+#ifndef DWMWA_BORDER_COLOR
+#define DWMWA_BORDER_COLOR 34
+#endif
+#ifndef DWMWA_COLOR_NONE
+#define DWMWA_COLOR_NONE 0xFFFFFFFE
+#endif
+#ifndef DWMWA_COLOR_DEFAULT
+#define DWMWA_COLOR_DEFAULT 0xFFFFFFFF
+#endif
 
 // ============================================================================
 // MoonWindow Structure (Multi-Window Support)
@@ -68,13 +77,14 @@ struct MoonWindow {
     // Parent window
     int parentId;
     bool modal;
+    bool inSizeMove;  // true between WM_ENTERSIZEMOVE and WM_EXITSIZEMOVE (avoids black block on transparent resize/drag)
     
     MoonWindow() : id(0), hwnd(NULL), webviewReady(false), showPending(false),
         frameless(false), transparent(false), topmost(false),
         resizable(true), clickThrough(false), devtools(false), alpha(255),
         messageCallback(nullptr), closeCallback(nullptr),
         pendingHtml(nullptr), pendingUrl(nullptr),
-        parentId(0), modal(false) {}
+        parentId(0), modal(false), inSizeMove(false) {}
     
     ~MoonWindow() {
         if (pendingHtml) free(pendingHtml);
@@ -244,6 +254,42 @@ static int ScaleForDpi(int value) {
     return (int)(value * g_dpiScale + 0.5f);
 }
 
+static int GetResizeBorderPixels() {
+    int paddedBorder = GetSystemMetrics(SM_CXPADDEDBORDER);
+    int border = GetSystemMetrics(SM_CXSIZEFRAME) + paddedBorder;
+    if (border < 8) border = 8;
+    return border;
+}
+
+static int GetWebViewInsetPixels() {
+    // Keep only a very thin visible border.
+    // Resize hit-test still uses GetResizeBorderPixels().
+    return 1;
+}
+
+static void UpdateWebViewBounds(MoonWindow* win) {
+    if (!win || !win->controller || !win->hwnd) return;
+
+    RECT bounds;
+    GetClientRect(win->hwnd, &bounds);
+
+    // Transparent windows should stay fully interactive to the edge.
+    int inset = 0;
+    if (win->frameless && !win->transparent && win->resizable) {
+        inset = GetWebViewInsetPixels();
+    }
+
+    bounds.left += inset;
+    bounds.top += inset;
+    bounds.right -= inset;
+    bounds.bottom -= inset;
+    if (bounds.right < bounds.left) bounds.right = bounds.left;
+    if (bounds.bottom < bounds.top) bounds.bottom = bounds.top;
+
+    win->controller->put_Bounds(bounds);
+    win->controller->NotifyParentWindowPositionChanged();
+}
+
 // ============================================================================
 // WebView2 Initialization (Per-Window)
 // ============================================================================
@@ -293,13 +339,13 @@ static void InitializeWebView2ForWindow(MoonWindow* win) {
                 ComPtr<ICoreWebView2Controller2> controller2;
                 if (SUCCEEDED(controller->QueryInterface(IID_PPV_ARGS(&controller2)))) {
                     if (win->transparent) {
-                        // Transparent background
-                        COREWEBVIEW2_COLOR transparent = { 0, 255, 255, 255 };
+                        // True transparent background for transparent window mode.
+                        COREWEBVIEW2_COLOR transparent = { 0, 0, 0, 0 };
                         controller2->put_DefaultBackgroundColor(transparent);
                     } else if (win->frameless) {
-                        // Frameless: match typical page background to reduce white flash
-                        // Light gray (#f5f5f5)
-                        COREWEBVIEW2_COLOR bgColor = { 255, 245, 245, 245 };
+                        // Frameless: use dark neutral background to avoid bright resize border.
+                        // Dark slate (#1e1e2e)
+                        COREWEBVIEW2_COLOR bgColor = { 255, 30, 30, 46 };
                         controller2->put_DefaultBackgroundColor(bgColor);
                     }
                 }
@@ -369,43 +415,61 @@ static void InitializeWebView2ForWindow(MoonWindow* win) {
                         }).Get(), nullptr);
                 
                 // Set bounds
-                RECT bounds;
-                GetClientRect(win->hwnd, &bounds);
-                win->controller->put_Bounds(bounds);
+                UpdateWebViewBounds(win);
                 
                 // Handle messages from web page
                 win->webview->add_WebMessageReceived(
                     Callback<ICoreWebView2WebMessageReceivedEventHandler>(
                         [win](ICoreWebView2* webview, ICoreWebView2WebMessageReceivedEventArgs* args) -> HRESULT {
-                            LPWSTR message;
+                            LPWSTR message = nullptr;
                             args->TryGetWebMessageAsString(&message);
                             if (message) {
-                                if (wcscmp(message, L"__drag__") == 0) {
+                                std::wstring msg(message);
+                                if (msg.size() >= 2 && msg.front() == L'"' && msg.back() == L'"') {
+                                    msg = msg.substr(1, msg.size() - 2);
+                                }
+
+                                if (msg == L"__drag__") {
                                     ReleaseCapture();
-                                    SendMessageW(win->hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0);
-                                } else if (wcscmp(message, L"__close__") == 0) {
+                                    SendMessageW(win->hwnd, WM_SYSCOMMAND, SC_MOVE | HTCAPTION, 0);
+                                } else if (msg.rfind(L"__resize__:", 0) == 0) {
+                                    std::wstring dir = msg.substr(11);
+                                    WPARAM hit = HTNOWHERE;
+                                    if (dir == L"left") hit = HTLEFT;
+                                    else if (dir == L"right") hit = HTRIGHT;
+                                    else if (dir == L"top") hit = HTTOP;
+                                    else if (dir == L"bottom") hit = HTBOTTOM;
+                                    else if (dir == L"top-left") hit = HTTOPLEFT;
+                                    else if (dir == L"top-right") hit = HTTOPRIGHT;
+                                    else if (dir == L"bottom-left") hit = HTBOTTOMLEFT;
+                                    else if (dir == L"bottom-right") hit = HTBOTTOMRIGHT;
+                                    if (hit != HTNOWHERE) {
+                                        ReleaseCapture();
+                                        SendMessageW(win->hwnd, WM_NCLBUTTONDOWN, hit, 0);
+                                    }
+                                } else if (msg == L"__close__") {
                                     PostMessageW(win->hwnd, WM_CLOSE, 0, 0);
-                                } else if (wcscmp(message, L"__minimize__") == 0) {
+                                } else if (msg == L"__minimize__") {
                                     ShowWindow(win->hwnd, SW_MINIMIZE);
-                                } else if (wcscmp(message, L"__maximize__") == 0) {
+                                } else if (msg == L"__maximize__") {
                                     if (IsZoomed(win->hwnd)) {
                                         ShowWindow(win->hwnd, SW_RESTORE);
                                     } else {
                                         ShowWindow(win->hwnd, SW_MAXIMIZE);
                                     }
-                                } else if (wcsncmp(message, L"__call__:", 9) == 0) {
+                                } else if (msg.rfind(L"__call__:", 0) == 0) {
                                     // Handle function call: __call__:funcName:callId:argsJson
-                                    char* utf8Msg = wchar_to_utf8(message + 9);
-                                    std::string msg = utf8Msg;
+                                    char* utf8Msg = wchar_to_utf8(msg.c_str() + 9);
+                                    std::string msgStr = utf8Msg;
                                     free(utf8Msg);
                                     
                                     // Parse: funcName:callId:argsJson
-                                    size_t pos1 = msg.find(':');
-                                    size_t pos2 = msg.find(':', pos1 + 1);
+                                    size_t pos1 = msgStr.find(':');
+                                    size_t pos2 = msgStr.find(':', pos1 + 1);
                                     if (pos1 != std::string::npos && pos2 != std::string::npos) {
-                                        std::string funcName = msg.substr(0, pos1);
-                                        std::string callId = msg.substr(pos1 + 1, pos2 - pos1 - 1);
-                                        std::string argsJson = msg.substr(pos2 + 1);
+                                        std::string funcName = msgStr.substr(0, pos1);
+                                        std::string callId = msgStr.substr(pos1 + 1, pos2 - pos1 - 1);
+                                        std::string argsJson = msgStr.substr(pos2 + 1);
                                         
                                         // Find exposed function
                                         auto it = win->exposedFuncs.find(funcName);
@@ -474,8 +538,8 @@ static void InitializeWebView2ForWindow(MoonWindow* win) {
                         }).Get(), nullptr);
                 
                 // Inject MoonGUI API with window ID
-                wchar_t script[4096];
-                swprintf_s(script, 4096,
+                wchar_t script[8192];
+                swprintf_s(script, 8192,
                     L"window.__moonCallId = 0;"
                     L"window.__moonCallResults = {};"
                     L"window.MoonGUI = {"
@@ -501,6 +565,47 @@ static void InitializeWebView2ForWindow(MoonWindow* win) {
                     L"    return this.call.apply(this, arguments);"
                     L"  }"
                     L"};"
+                    L"if (%d) {"
+                    L"  var __moonEdgeSize = 8;"
+                    L"  function __moonEdgeHit(e) {"
+                    L"    var w = window.innerWidth || document.documentElement.clientWidth || 0;"
+                    L"    var h = window.innerHeight || document.documentElement.clientHeight || 0;"
+                    L"    var x = e.clientX, y = e.clientY;"
+                    L"    var onL = x <= __moonEdgeSize, onR = x >= (w - __moonEdgeSize);"
+                    L"    var onT = y <= __moonEdgeSize, onB = y >= (h - __moonEdgeSize);"
+                    L"    if (onT && onL) return 'top-left';"
+                    L"    if (onT && onR) return 'top-right';"
+                    L"    if (onB && onL) return 'bottom-left';"
+                    L"    if (onB && onR) return 'bottom-right';"
+                    L"    if (onL) return 'left';"
+                    L"    if (onR) return 'right';"
+                    L"    if (onT) return 'top';"
+                    L"    if (onB) return 'bottom';"
+                    L"    return '';"
+                    L"  }"
+                    L"  function __moonEdgeCursor(edge) {"
+                    L"    if (edge === 'left' || edge === 'right') return 'ew-resize';"
+                    L"    if (edge === 'top' || edge === 'bottom') return 'ns-resize';"
+                    L"    if (edge === 'top-left' || edge === 'bottom-right') return 'nwse-resize';"
+                    L"    if (edge === 'top-right' || edge === 'bottom-left') return 'nesw-resize';"
+                    L"    return '';"
+                    L"  }"
+                    L"  document.addEventListener('mousemove', function(e) {"
+                    L"    var edge = __moonEdgeHit(e);"
+                    L"    document.documentElement.style.cursor = __moonEdgeCursor(edge);"
+                    L"  }, true);"
+                    L"  document.addEventListener('mouseleave', function() {"
+                    L"    document.documentElement.style.cursor = '';"
+                    L"  }, true);"
+                    L"  document.addEventListener('mousedown', function(e) {"
+                    L"    if (e.button !== 0) return;"
+                    L"    var edge = __moonEdgeHit(e);"
+                    L"    if (!edge) return;"
+                    L"    e.preventDefault();"
+                    L"    e.stopImmediatePropagation();"
+                    L"    window.chrome.webview.postMessage('__resize__:' + edge);"
+                    L"  }, true);"
+                    L"}"
                     L"document.addEventListener('mousedown', function(e) {"
                     L"  var el = e.target;"
                     L"  while (el) {"
@@ -514,7 +619,8 @@ static void InitializeWebView2ForWindow(MoonWindow* win) {
                     L"    if (region === 'no-drag') return;"
                     L"    el = el.parentElement;"
                     L"  }"
-                    L"});", win->id);
+                    L"});", win->id,
+                    (win->transparent && win->frameless && win->resizable) ? 1 : 0);
                 
                 win->webview->AddScriptToExecuteOnDocumentCreated(script, nullptr);
                 
@@ -595,50 +701,154 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         case WM_CREATE:
             InitializeWebView2ForWindow(win);
             return 0;
+
+        case WM_ERASEBKGND:
+            if (win->transparent) {
+                // Transparent windows must not paint class background, otherwise
+                // a solid rectangle appears behind transparent web content.
+                return 1;
+            }
+            break;
         
         case WM_NCCALCSIZE:
-            // For frameless (non-transparent) windows: extend client area to full window
-            // Combined with DwmExtendFrameIntoClientArea, this gives us Win11 animations
-            if (wParam == TRUE && win->frameless && !win->transparent) {
+            // For non-transparent frameless windows: extend client area to full window.
+            // Transparent windows use WS_POPUP and do not need this override.
+            if (win->frameless && !win->transparent) {
                 // Return 0 without modifying params = client area fills entire window
                 return 0;
             }
             break;
         
         case WM_NCHITTEST: {
-            // For frameless windows: enable resize from edges
-            if (win->frameless && !win->transparent && win->resizable) {
-                POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
-                ScreenToClient(hwnd, &pt);
-                RECT rc;
-                GetClientRect(hwnd, &rc);
-                
-                const int border = 8;  // Resize border width
-                
-                if (pt.y < border) {
-                    if (pt.x < border) return HTTOPLEFT;
-                    if (pt.x >= rc.right - border) return HTTOPRIGHT;
-                    return HTTOP;
+            if (win->frameless) {
+                // For frameless windows: enable resize from edges.
+                if (win->resizable) {
+                    if (win->transparent) {
+                        RECT windowRect;
+                        if (!GetWindowRect(hwnd, &windowRect)) break;
+                        POINT screenPt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+                        int border = GetResizeBorderPixels();
+
+                        bool onLeft = screenPt.x >= windowRect.left && screenPt.x < (windowRect.left + border);
+                        bool onRight = screenPt.x < windowRect.right && screenPt.x >= (windowRect.right - border);
+                        bool onTop = screenPt.y >= windowRect.top && screenPt.y < (windowRect.top + border);
+                        bool onBottom = screenPt.y < windowRect.bottom && screenPt.y >= (windowRect.bottom - border);
+
+                        if (onTop) {
+                            if (onLeft) return HTTOPLEFT;
+                            if (onRight) return HTTOPRIGHT;
+                            return HTTOP;
+                        }
+                        if (onBottom) {
+                            if (onLeft) return HTBOTTOMLEFT;
+                            if (onRight) return HTBOTTOMRIGHT;
+                            return HTBOTTOM;
+                        }
+                        if (onLeft) return HTLEFT;
+                        if (onRight) return HTRIGHT;
+                    } else {
+                        RECT windowRect;
+                        HRESULT hr = DwmGetWindowAttribute(
+                            hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &windowRect, sizeof(windowRect));
+                        if (FAILED(hr)) {
+                            if (!GetWindowRect(hwnd, &windowRect)) {
+                                break;
+                            }
+                        }
+                        POINT screenPt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+
+                        // Match OS frame thickness as much as possible, with a safe minimum.
+                        int borderX = GetResizeBorderPixels();
+                        int borderY = borderX;
+
+                        bool onLeft = screenPt.x >= windowRect.left && screenPt.x < (windowRect.left + borderX);
+                        bool onRight = screenPt.x < windowRect.right && screenPt.x >= (windowRect.right - borderX);
+                        bool onTop = screenPt.y >= windowRect.top && screenPt.y < (windowRect.top + borderY);
+                        bool onBottom = screenPt.y < windowRect.bottom && screenPt.y >= (windowRect.bottom - borderY);
+
+                        if (onTop) {
+                            if (onLeft) return HTTOPLEFT;
+                            if (onRight) return HTTOPRIGHT;
+                            return HTTOP;
+                        }
+                        if (onBottom) {
+                            if (onLeft) return HTBOTTOMLEFT;
+                            if (onRight) return HTBOTTOMRIGHT;
+                            return HTBOTTOM;
+                        }
+                        if (onLeft) return HTLEFT;
+                        if (onRight) return HTRIGHT;
+                    }
                 }
-                if (pt.y >= rc.bottom - border) {
-                    if (pt.x < border) return HTBOTTOMLEFT;
-                    if (pt.x >= rc.right - border) return HTBOTTOMRIGHT;
-                    return HTBOTTOM;
-                }
-                if (pt.x < border) return HTLEFT;
-                if (pt.x >= rc.right - border) return HTRIGHT;
+
+                // Keep frameless interior interactive for WebView input/drag regions.
+                return HTCLIENT;
             }
             break;
         }
-            
+
         case WM_SIZE:
             if (win->controller) {
-                RECT bounds;
-                GetClientRect(hwnd, &bounds);
-                win->controller->put_Bounds(bounds);
+                UpdateWebViewBounds(win);
             }
             return 0;
-        
+
+        case WM_SIZING:
+            if (win->controller) {
+                UpdateWebViewBounds(win);
+            }
+            return TRUE;
+
+        case WM_WINDOWPOSCHANGED:
+            if (win->controller) {
+                UpdateWebViewBounds(win);
+            }
+            break;
+
+        case WM_SETCURSOR:
+            if (win->frameless && win->resizable) {
+                switch (LOWORD(lParam)) {
+                    case HTLEFT:
+                    case HTRIGHT:
+                        SetCursor(LoadCursor(NULL, IDC_SIZEWE));
+                        return TRUE;
+                    case HTTOP:
+                    case HTBOTTOM:
+                        SetCursor(LoadCursor(NULL, IDC_SIZENS));
+                        return TRUE;
+                    case HTTOPLEFT:
+                    case HTBOTTOMRIGHT:
+                        SetCursor(LoadCursor(NULL, IDC_SIZENWSE));
+                        return TRUE;
+                    case HTTOPRIGHT:
+                    case HTBOTTOMLEFT:
+                        SetCursor(LoadCursor(NULL, IDC_SIZENESW));
+                        return TRUE;
+                    default:
+                        break;
+                }
+            }
+            break;
+
+        case WM_MOVE:
+        case WM_EXITSIZEMOVE:
+            if (win->controller) {
+                UpdateWebViewBounds(win);
+                if (msg == WM_EXITSIZEMOVE) {
+                    win->inSizeMove = false;
+                    if (win->transparent && win->frameless && win->resizable) {
+                        SetLayeredWindowAttributes(hwnd, 0, (BYTE)win->alpha, LWA_ALPHA);
+                        COLORREF borderNone = DWMWA_COLOR_NONE;
+                        DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &borderNone, sizeof(borderNone));
+                        if (win->webview) {
+                            win->webview->ExecuteScript(
+                                L"window.dispatchEvent(new Event('resize'));", nullptr);
+                        }
+                    }
+                }
+            }
+            return 0;
+
         case WM_DPICHANGED: {
             g_dpi = HIWORD(wParam);
             g_dpiScale = (float)g_dpi / 96.0f;
@@ -717,9 +927,6 @@ MoonValue* moon_gui_init(void) {
     if (!g_appIconSmall) g_appIconSmall = LoadIconW(NULL, IDI_APPLICATION);
     
     // Register window class
-    // Create background brush matching typical page background (#f5f5f5)
-    static HBRUSH s_bgBrush = CreateSolidBrush(RGB(245, 245, 245));
-    
     WNDCLASSEXW wc = {0};
     wc.cbSize = sizeof(WNDCLASSEXW);
     wc.style = CS_HREDRAW | CS_VREDRAW;
@@ -728,9 +935,18 @@ MoonValue* moon_gui_init(void) {
     wc.hIcon = g_appIcon;
     wc.hIconSm = g_appIconSmall;
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    // Match frameless fallback/background with dark neutral color (#1e1e2e).
+    static HBRUSH s_bgBrush = CreateSolidBrush(RGB(30, 30, 46));
     wc.hbrBackground = s_bgBrush;
     wc.lpszClassName = L"MoonLangWindow";
     
+    if (!RegisterClassExW(&wc)) {
+        return moon_bool(false);
+    }
+    
+    // Transparent windows: no class background so newly exposed area on resize/drag is not filled (avoids "different background" block).
+    wc.hbrBackground = (HBRUSH)GetStockObject(NULL_BRUSH);
+    wc.lpszClassName = L"MoonLangWindowTransparent";
     if (!RegisterClassExW(&wc)) {
         return moon_bool(false);
     }
@@ -852,7 +1068,8 @@ MoonValue* moon_gui_create_advanced(MoonValue* title, MoonValue* width, MoonValu
         
         if (win->frameless) {
             if (win->transparent) {
-                // Transparent: pure popup, no system frame
+                // Transparent mode keeps popup style for true alpha composition.
+                // This avoids hidden frame artifacts and preserves pure transparent visuals.
                 style = WS_POPUP;
             } else {
                 // Frameless with Win11 animations (like Wails):
@@ -894,9 +1111,10 @@ MoonValue* moon_gui_create_advanced(MoonValue* title, MoonValue* width, MoonValu
     
     wchar_t* wtitle = utf8_to_wchar(titleStr);
     
+    const wchar_t* className = win->transparent ? L"MoonLangWindowTransparent" : L"MoonLangWindow";
     HWND hwnd = CreateWindowExW(
         exStyle,
-        L"MoonLangWindow",
+        className,
         wtitle,
         style,
         posX, posY, scaledW, scaledH,
@@ -913,15 +1131,31 @@ MoonValue* moon_gui_create_advanced(MoonValue* title, MoonValue* width, MoonValu
     // Update DPI scale
     UpdateDpiScale(hwnd);
     
-    // Set layered window attributes
-    if (win->alpha < 255) {
+    // Set layered window attributes.
+    // For transparent windows, force explicit alpha mode to avoid resize-time
+    // hit-test fallback that can behave like click-through on new pixels.
+    if (win->transparent || win->alpha < 255) {
         SetLayeredWindowAttributes(hwnd, 0, (BYTE)win->alpha, LWA_ALPHA);
     }
     
-    // Enable Win11 rounded corners (for all non-transparent windows)
+    // BUG FIX (do not revert): Do NOT set DWMWA_WINDOW_CORNER_PREFERENCE for transparent
+    // windows. It causes a visible rectangular transparent layer/band around the content.
+    // Round look must come from HTML/CSS (border-radius) only for transparent windows.
     if (!win->transparent) {
         DWM_WINDOW_CORNER_PREFERENCE preference = DWMWCP_ROUND;
         DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &preference, sizeof(preference));
+    }
+
+    // Transparent frameless: hide DWM border.
+    if (win->frameless && win->transparent) {
+        COLORREF borderNone = DWMWA_COLOR_NONE;
+        DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &borderNone, sizeof(borderNone));
+    }
+
+    // Frameless windows: use Windows default border rendering for native look.
+    if (win->frameless && !win->transparent) {
+        COLORREF borderColor = DWMWA_COLOR_DEFAULT;
+        DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &borderColor, sizeof(borderColor));
     }
     
     // For frameless windows: extend DWM frame into client area (like Wails)
@@ -939,19 +1173,20 @@ MoonValue* moon_gui_create_advanced(MoonValue* title, MoonValue* width, MoonValu
         g_trayOwnerWindow = hwnd;
     }
     
-    // For frameless windows: force frame update BEFORE showing
-    // This applies WM_NCCALCSIZE so window shows without title bar
-    if (win->frameless && !win->transparent) {
+    // For frameless windows: force frame update BEFORE showing.
+    // This applies WM_NCCALCSIZE consistently across transparent/non-transparent.
+    if (win->frameless) {
         SetWindowPos(hwnd, NULL, 0, 0, 0, 0, 
             SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE);
-        // Start fully transparent, fade in after content loads
-        SetLayeredWindowAttributes(hwnd, 0, 0, LWA_ALPHA);
-        win->showPending = true;
+        if (!win->transparent) {
+            // Start fully transparent, fade in after content loads
+            SetLayeredWindowAttributes(hwnd, 0, 0, LWA_ALPHA);
+            win->showPending = true;
+        }
     }
     
     ShowWindow(hwnd, SW_SHOW);
     UpdateWindow(hwnd);
-    
     return moon_int(win->id);
 }
 
